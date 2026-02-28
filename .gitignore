@@ -7,3 +7,6 @@
 .venv/
 uv.lock
 __pycache__/
+
+# IDE
+.idea/
