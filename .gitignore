@@ -1,0 +1,8 @@
+# Maps and db
+*.db
+*.mbtiles
+*.xml
+
+# Python Environnements 
+.venv/
+__pycache__/
