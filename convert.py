@@ -1,6 +1,5 @@
 import sqlite3
 import os
-import glob
 import math
 import re
 import xml.etree.ElementTree as ET
@@ -8,35 +7,26 @@ from PIL import Image
 import io
 import multiprocessing
 import time
+from pathlib import Path
 
 # --- CONFIGURATION ---
 # Set to False to disable multiprocessing and run in single-thread mode
 USE_MULTIPROCESSING = True  
+# Define the root folder containing your region subfolders (e.g., "./cartes" or "C:/Maps")
+# "." means the current folder where the script is located.
+ROOT_FOLDER = "./France IGN 2019"
 # ---------------------
 
-# Lift Pillow's security limit on very large images (just in case)
 Image.MAX_IMAGE_PIXELS = None
-
-# Global variable specific to EACH worker process
 worker_db_conn = None
 
 def init_worker(source_db_path):
-    """
-    Initializes the SQLite connection for each CPU core.
-    Uses 'ro' (Read-Only) mode to allow massive simultaneous reads.
-    In single-process mode, this initializes the main thread's connection.
-    """
     global worker_db_conn
     db_uri = f"file:{os.path.abspath(source_db_path)}?mode=ro"
     worker_db_conn = sqlite3.connect(db_uri, uri=True)
 
 def process_single_tile(args):
-    """
-    The function executed in parallel by each CPU core (or sequentially if disabled).
-    """
     tx, ty, z, tl_px, tl_py, info = args
-    
-    # Calculate intersections (which Orux source tiles touch this MBTiles square)
     cx_min = max(0, math.floor((tx * 256 - tl_px - 512) / 512))
     cx_max = min(info['xMax'] - 1, math.floor((tx * 256 + 256 - tl_px) / 512))
     cy_min = max(0, math.floor((ty * 256 - tl_py - 512) / 512))
@@ -48,18 +38,13 @@ def process_single_tile(args):
     
     for cx in range(cx_min, cx_max + 1):
         for cy in range(cy_min, cy_max + 1):
-            # Fetch the image directly from the database
             cur.execute("SELECT image FROM tiles WHERE z=? AND x=? AND y=?", (z, cx, cy))
             row = cur.fetchone()
-            
             if row:
                 if out_img is None:
-                    # Create the white canvas only if a tile is found
                     out_img = Image.new('RGB', (256, 256), (255, 255, 255))
-                    
                 paste_x = (tl_px + cx * 512) - (tx * 256)
                 paste_y = (tl_py + cy * 512) - (ty * 256)
-                
                 try:
                     orux_img = Image.open(io.BytesIO(row[0]))
                     if orux_img.mode != 'RGB':
@@ -70,16 +55,10 @@ def process_single_tile(args):
                     pass
                     
     if has_content:
-        # JPEG compression in RAM
         img_byte_arr = io.BytesIO()
         out_img.save(img_byte_arr, format='JPEG', quality=85)
-        
-        # Invert Y axis (TMS standard)
         ty_tms = (2 ** z - 1) - ty
-        
-        # Return the result back to the Main Process
         return (z, tx, ty_tms, img_byte_arr.getvalue())
-        
     return None
 
 def parse_orux_xml(xml_file):
@@ -101,23 +80,16 @@ def parse_orux_xml(xml_file):
         }
     return cal_data
 
-def convert_to_mbtiles():
-    db_files = glob.glob("*.db")
-    xml_files = glob.glob("*.xml")
-    
-    if not db_files or not xml_files:
-        print("ERROR: Missing .db or .xml file.")
-        return
-        
-    source_db = db_files[0]
-    source_xml = xml_files[0]
+def convert_map(source_db, source_xml):
+    """Convert one map. Called by main loop."""
     output_file = source_db.replace('.db', '.mbtiles')
-    
-    if os.path.exists(output_file): os.remove(output_file)
+    if os.path.exists(output_file): 
+        os.remove(output_file)
 
+    print(f"\n[{time.strftime('%H:%M:%S')}] ⚙️ Starting conversion for: {os.path.basename(source_db)}")
+    map_start_time = time.time()
     cal_data = parse_orux_xml(source_xml)
     
-    # MBTiles creation (Main Process)
     conn_mb = sqlite3.connect(output_file)
     cur_mb = conn_mb.cursor()
     cur_mb.execute("CREATE TABLE metadata (name text, value text);")
@@ -128,18 +100,13 @@ def convert_to_mbtiles():
     pool = None
     if USE_MULTIPROCESSING:
         cores = multiprocessing.cpu_count()
-        print(f"🚀 Starting in Multiprocessing mode ({cores} cores)...")
         pool = multiprocessing.Pool(processes=cores, initializer=init_worker, initargs=(source_db,))
     else:
-        print("🐌 Starting in Single-process mode (Multiprocessing disabled)...")
         init_worker(source_db)
-        
-    # Init time measuring
-    global_start_time = time.time()
 
     try:
         for z, info in cal_data.items():
-            print(f"\n--- Processing Zoom Level {z} ---")
+            print(f"   -> Processing Zoom Level {z}...")
             
             n = 2.0 ** z
             world_px_width = 256 * n
@@ -155,9 +122,6 @@ def convert_to_mbtiles():
             ty_max = int((tl_py + height_px) // 256)
             
             total_mbtiles = (tx_max - tx_min + 1) * (ty_max - ty_min + 1)
-            print(f"Target global grid: {total_mbtiles} tiles to generate.")
-
-            # Task list generator (uses almost 0 RAM)
             tasks = (
                 (tx, ty, z, tl_px, tl_py, info)
                 for tx in range(tx_min, tx_max + 1)
@@ -167,20 +131,15 @@ def convert_to_mbtiles():
             created_tiles = 0
             
             if pool:
-                # Execution distributed across CPU cores
                 for result in pool.imap_unordered(process_single_tile, tasks, chunksize=100):
                     if result:
                         cur_mb.execute("INSERT INTO tiles VALUES (?, ?, ?, ?)", result)
                         created_tiles += 1
                     
                     if created_tiles % 1000 == 0:
-                        # Compute and format time
-                        elapsed = time.time() - global_start_time
-                        elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
-                        
-                        print(f"[{elapsed_str}] Progress: {created_tiles}/{total_mbtiles} tiles generated...")
+                        elapsed = time.strftime("%H:%M:%S", time.gmtime(time.time() - map_start_time))
+                        print(f"      [{elapsed}] Progress: {created_tiles}/{total_mbtiles} tiles...")
             else:
-                # Execution sequentially on the main thread
                 for task in tasks:
                     result = process_single_tile(task)
                     if result:
@@ -188,21 +147,19 @@ def convert_to_mbtiles():
                         created_tiles += 1
                     
                     if created_tiles % 1000 == 0:
-                        # Compute and format time
-                        elapsed = time.time() - global_start_time
-                        elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
-                        
-                        print(f"[{elapsed_str}] Progress: {created_tiles}/{total_mbtiles} tiles generated...")
+                        elapsed = time.strftime("%H:%M:%S", time.gmtime(time.time() - map_start_time))
+                        print(f"      [{elapsed}] Progress: {created_tiles}/{total_mbtiles} tiles...")
 
-            print(f"✅ Level {z} completed ({created_tiles} tiles).")
+            print(f"   ✅ Level {z} completed ({created_tiles} tiles).")
 
     finally:
-        # Ensures the pool is properly closed even if an error occurs
         if pool:
             pool.close()
             pool.join()
 
-    cur_mb.execute("INSERT INTO metadata VALUES ('name', 'Reprojected Map')")
+    # Get map name from file for metadata
+    map_name = os.path.splitext(os.path.basename(source_db))[0]
+    cur_mb.execute("INSERT INTO metadata VALUES ('name', ?)", (map_name,))
     cur_mb.execute("INSERT INTO metadata VALUES ('format', 'jpg')")
     cur_mb.execute("INSERT INTO metadata VALUES ('type', 'overlay')")
     cur_mb.execute("INSERT INTO metadata VALUES ('version', '1.0')")
@@ -211,13 +168,62 @@ def convert_to_mbtiles():
     conn_mb.commit()
     conn_mb.close()
     
-    # End time measuring
-    total_elapsed = time.time() - global_start_time
-    total_str = time.strftime("%H:%M:%S", time.gmtime(total_elapsed))
-    
-    print(f"\n🎉 Total conversion completed successfully in {total_str}! File: {output_file}")
+    map_elapsed = time.strftime("%H:%M:%S", time.gmtime(time.time() - map_start_time))
+    print(f"[{time.strftime('%H:%M:%S')}] 🎉 Map finished in {map_elapsed} -> {output_file}")
 
-# MANDATORY security on Windows for Multiprocessing
+def main():
+    """Fonction principale qui scanne les dossiers et lance les conversions."""
+    print("=======================================================")
+    print("🗺️  OruxMaps to MBTiles Batch Converter")
+    print("=======================================================")
+    
+    root_path = Path(ROOT_FOLDER)
+    if not root_path.exists() or not root_path.is_dir():
+        print(f"ERROR: The root folder '{ROOT_FOLDER}' does not exist.")
+        return
+
+    # Recherche récursive de tous les fichiers .db
+    db_files = list(root_path.rglob("*.db"))
+    
+    if not db_files:
+        print(f"No .db files found in {root_path.absolute()}")
+        return
+
+    print(f"🔍 Found {len(db_files)} potential map database(s).")
+    
+    maps_to_process = []
+    
+    # Validation des paires db/xml
+    for db_path in db_files:
+        # Cherche tous les fichiers xml dans le même dossier que le .db
+        xml_files = list(db_path.parent.glob("*.xml"))
+        if not xml_files:
+            print(f"⚠️ Warning: Skipping '{db_path.name}' (no XML file found in its folder).")
+            continue
+            
+        # On prend le premier XML trouvé (généralement il n'y en a qu'un)
+        xml_path = xml_files[0]
+        maps_to_process.append((str(db_path), str(xml_path)))
+
+    if not maps_to_process:
+        print("No valid db/xml pairs found to process.")
+        return
+
+    print(f"🚀 Ready to process {len(maps_to_process)} map(s).")
+    
+    global_start_time = time.time()
+    
+    # Traitement séquentiel de chaque carte
+    for count, (db_file, xml_file) in enumerate(maps_to_process, 1):
+        print(f"\n--- Processing Map {count}/{len(maps_to_process)} ---")
+        convert_map(db_file, xml_file)
+        
+    global_elapsed = time.strftime("%H:%M:%S", time.gmtime(time.time() - global_start_time))
+    print("\n=======================================================")
+    print(f"🏆 ALL JOBS COMPLETED SUCCESSFULLY!")
+    print(f"⏱️ Total time for {len(maps_to_process)} map(s): {global_elapsed}")
+    print("=======================================================")
+
 if __name__ == "__main__":
     multiprocessing.freeze_support()
-    convert_to_mbtiles()
+    main()

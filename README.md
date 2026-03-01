@@ -12,9 +12,11 @@ This script solves this by **reading the Orux XML calibration file**. It calcula
 
 ## Features
 
+* **Automated Batch Processing:** Recursively scans your folders to find and convert multiple `.db`/`.xml` pairs in one go.
 * **Pixel-Perfect Alignment:** Uses XML Top-Left (TL) anchor points to recalculate and snap tiles to the absolute Web Mercator grid.
 * **Smart Resizing:** Automatically detects 512x512px source tiles and slices them into standard 256x256px MBTiles.
 * **Multiprocessing Powered:** Utilizes 100% of your CPU cores to process thousands of tiles concurrently.
+* **Live Time Tracking:** Displays elapsed time for each map and the total batch job.
 * **Low RAM Footprint:** Instead of building a massive map in memory, it calculates overlaps mathematically and loads only the required source tiles per zoom level.
 
 ## Installation
