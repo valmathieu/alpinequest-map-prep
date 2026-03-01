@@ -5,7 +5,6 @@
 
 # Python Environnements 
 .venv/
-uv.lock
 __pycache__/
 
 # IDE
