@@ -24,6 +24,7 @@ Image.MAX_IMAGE_PIXELS = None
 
 # Global variable for the multiprocessing worker to hold its own DB connection
 worker_db_conn = None
+downscale_worker_conn = None
 
 
 def init_worker(source_db_path):
@@ -113,6 +114,77 @@ def process_single_tile(args):
 
     return None
 
+def init_downscale_worker(mbtiles_path):
+    """
+    Initializes a read-only SQLite database connection for the downscaling workers.
+
+    This function is called once per worker process to ensure each has its own
+    isolated database connection, preventing threading conflicts during concurrent reads.
+
+    Args:
+        mbtiles_path (str): The absolute or relative path to the generated .mbtiles file.
+    """
+    global downscale_worker_conn
+    db_uri = f"file:{os.path.abspath(mbtiles_path)}?mode=ro"
+    downscale_worker_conn = sqlite3.connect(db_uri, uri=True, timeout=15.0)
+
+
+def process_downscale_tile(args):
+    """
+    Worker function that assembles 4 child tiles and downscales them into 1 parent tile.
+
+    It queries the database for the four high-resolution tiles at zoom level `z+1`
+    that correspond to the target parent tile at zoom level `z`. It pastes them
+    onto a 512x512 canvas and applies a high-quality Lanczos filter to downscale
+    the result to a standard 256x256 MBTile.
+
+    Args:
+        args (tuple): A tuple containing:
+            - z (int): The target zoom level of the parent tile.
+            - px (int): The X coordinate (column) of the target parent tile.
+            - py (int): The Y coordinate (row) of the target parent tile.
+
+    Returns:
+        tuple: A tuple containing `(z, px, py, image_bytes)` ready to be inserted
+               into the database if successful.
+        None: If none of the 4 child tiles exist (empty canvas).
+    """
+    z, px, py = args
+    canvas = Image.new('RGB', (512, 512), (255, 255, 255))
+    has_content = False
+
+    # TMS positioning (origin is at the bottom-left of the map)
+    children = {
+        (2 * px, 2 * py + 1): (0, 0),  # Top-Left
+        (2 * px + 1, 2 * py + 1): (256, 0),  # Top-Right
+        (2 * px, 2 * py): (0, 256),  # Bottom-Left
+        (2 * px + 1, 2 * py): (256, 256)  # Bottom-Right
+    }
+
+    cur = downscale_worker_conn.cursor()
+    for (cx, cy), paste_pos in children.items():
+        cur.execute("SELECT tile_data FROM tiles WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?",
+                    (z + 1, cx, cy))
+        row = cur.fetchone()
+        if row:
+            try:
+                child_img = Image.open(io.BytesIO(row[0]))
+                if child_img.mode != 'RGB':
+                    child_img = child_img.convert('RGB')
+                canvas.paste(child_img, paste_pos)
+                has_content = True
+            except Exception:
+                # Silently ignore corrupted image blobs
+                pass
+
+    if has_content:
+        # High-quality downscaling
+        final_tile = canvas.resize((256, 256), getattr(Image, 'Resampling', Image).LANCZOS)
+        img_byte_arr = io.BytesIO()
+        final_tile.save(img_byte_arr, format='JPEG', quality=85)
+        return (z, px, py, img_byte_arr.getvalue())
+
+    return None
 
 def parse_orux_xml(xml_file):
     """
@@ -159,26 +231,29 @@ def parse_orux_xml(xml_file):
     return cal_data
 
 
-def fill_missing_zooms(conn_mb):
+def fill_missing_zooms(conn_mb, mbtiles_path):
     """
-        Generates missing intermediate zoom levels using a cascading Quadtree downscale.
+    Generates missing intermediate zoom levels using a multiprocessing Quadtree downscale.
 
-        Scans the MBTiles database for gaps between the maximum and minimum available
-        zoom levels. For every missing level `z`, it fetches the four corresponding
-        "parent" tiles from `z+1`, stitches them onto a 512x512 canvas, and applies
-        a high-quality Lanczos resampling to downscale them into a standard 256x256
-        MBTile. This prevents "black screens" in navigation apps when zooming between
-        native map resolutions.
+    Scans the MBTiles database for gaps between the maximum and minimum available
+    zoom levels. For every missing level `z`, it dispatches tasks to a multiprocessing
+    pool. The workers fetch the four corresponding "parent" tiles from `z+1`, stitch
+    them, and apply a high-quality Lanczos resampling to downscale them into a standard
+    256x256 MBTile.
 
-        Args:
-            conn_mb (sqlite3.Connection): An active SQLite database connection to
-                the target .mbtiles file.
+    Args:
+        conn_mb (sqlite3.Connection): An active SQLite database connection to
+            the target .mbtiles file (used for reading metadata and inserting new tiles).
+        mbtiles_path (str): The file path to the .mbtiles database, required to
+            initialize independent read-only connections for the multiprocessing workers.
 
-        Returns:
-            None: The function modifies the database in-place by inserting new tiles
-            and commits the changes after completing each zoom level.
-        """
+    Returns:
+        None: The function modifies the database in-place by inserting new tiles
+        and commits the changes after completing each zoom level.
+    """
     cur = conn_mb.cursor()
+
+    # Retrieve all currently existing zoom levels in descending order
     cur.execute("SELECT DISTINCT zoom_level FROM tiles ORDER BY zoom_level DESC")
     existing_zooms = [row[0] for row in cur.fetchall()]
 
@@ -188,63 +263,67 @@ def fill_missing_zooms(conn_mb):
     max_z = max(existing_zooms)
     min_z = min(existing_zooms)
 
-    # Browse from max_z to min_z to fill gaps
-    for z in range(max_z - 1, min_z - 1, -1):
-        if z in existing_zooms:
-            print(f"      ⏩ Zoom {z} detected (original source kept).")
-            continue
+    # Configure the multiprocessing pool for the downscaling tasks
+    pool = None
+    if USE_MULTIPROCESSING:
+        cores = multiprocessing.cpu_count()
+        pool = multiprocessing.Pool(processes=cores, initializer=init_downscale_worker, initargs=(mbtiles_path,))
+    else:
+        init_downscale_worker(mbtiles_path)
 
-        print(f"      🔨 Crafting Zoom {z} (reduction from Zoom {z + 1})...")
-        # Find all necessary parent tiles to cover level z
-        cur.execute("SELECT DISTINCT tile_column / 2, tile_row / 2 FROM tiles WHERE zoom_level = ?", (z + 1,))
-        parents = cur.fetchall()
+    try:
+        # Iterate downwards from max_z to min_z to fill the gaps in a cascade
+        for z in range(max_z - 1, min_z - 1, -1):
+            if z in existing_zooms:
+                print(f"      ⏩ Zoom {z} detected (original source kept).")
+                continue
 
-        created = 0
-        total = len(parents)
+            print(f"      🔨 Generating Zoom {z} (downscaling from Zoom {z + 1})...")
 
-        for i, (px, py) in enumerate(parents):
-            # Create a 512x512 white canva to paste children tiles
-            canvas = Image.new('RGB', (512, 512), (255, 255, 255))
-            has_content = False
+            # Find all unique parent tiles required for this zoom level
+            # A parent tile at zoom z corresponds to coordinates (cx/2, cy/2) from zoom z+1
+            cur.execute("SELECT DISTINCT tile_column / 2, tile_row / 2 FROM tiles WHERE zoom_level = ?", (z + 1,))
+            parents = cur.fetchall()
 
-            # TMS position (origin is bottom-left)
-            children = {
-                (2 * px, 2 * py + 1): (0, 0),  # Top-Left
-                (2 * px + 1, 2 * py + 1): (256, 0),  # Top-Right
-                (2 * px, 2 * py): (0, 256),  # Bottom-Left
-                (2 * px + 1, 2 * py): (256, 256)  # Bottom-Right
-            }
+            tasks = [(z, px, py) for px, py in parents]
+            total = len(tasks)
+            created = 0
+            start_z_time = time.time()
 
-            for (cx, cy), paste_pos in children.items():
-                cur.execute("SELECT tile_data FROM tiles WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?",
-                            (z + 1, cx, cy))
-                row = cur.fetchone()
-                if row:
-                    try:
-                        child_img = Image.open(io.BytesIO(row[0]))
-                        if child_img.mode != 'RGB':
-                            child_img = child_img.convert('RGB')
-                        canvas.paste(child_img, paste_pos)
-                        has_content = True
-                    except Exception:
-                        pass
+            # Process tasks concurrently using the multiprocessing pool
+            if pool:
+                for result in pool.imap_unordered(process_downscale_tile, tasks, chunksize=100):
+                    if result:
+                        cur.execute("INSERT INTO tiles VALUES (?, ?, ?, ?)", result)
+                        created += 1
 
-            if has_content:
-                # Resize high quality (downscale) to 256x256
-                # Use of Image.Resampling.LANCZOS to keep map sharpness
-                final_tile = canvas.resize((256, 256), getattr(Image, 'Resampling', Image).LANCZOS)
-                img_byte_arr = io.BytesIO()
-                final_tile.save(img_byte_arr, format='JPEG', quality=85)
+                    if created % 1000 == 0:
+                        elapsed = time.strftime("%M:%S", time.gmtime(time.time() - start_z_time))
+                        print(f"         [{elapsed}] Progress: {created}/{total} tiles generated...")
+            else:
+                # Fallback to single-threaded processing if multiprocessing is disabled
+                for task in tasks:
+                    result = process_downscale_tile(task)
+                    if result:
+                        cur.execute("INSERT INTO tiles VALUES (?, ?, ?, ?)", result)
+                        created += 1
 
-                cur.execute("INSERT INTO tiles VALUES (?, ?, ?, ?)", (z, px, py, img_byte_arr.getvalue()))
-                created += 1
+                    if created % 1000 == 0:
+                        elapsed = time.strftime("%M:%S", time.gmtime(time.time() - start_z_time))
+                        print(f"         [{elapsed}] Progress: {created}/{total} tiles generated...")
 
-            if (i + 1) % 1000 == 0:
-                print(f"         ... Progression : {i + 1}/{total} generated tiles.")
+            print(f"      ✅ Level {z} completed ({created} tiles created).")
 
-        print(f"      ✅ Zoom {z} done ({created} tiles generated).")
-        # Save after each generated zoom
-        conn_mb.commit()
+            # IMPORTANT: Commit the database after each zoom level.
+            # This ensures that the newly created level Z tiles are written to disk
+            # and can be read by the workers when generating level Z-1 in the next iteration.
+            conn_mb.commit()
+
+    finally:
+        # Ensure the pool is properly closed to prevent memory leaks and zombie processes
+        if pool:
+            pool.close()
+            pool.join()
 
 
 def convert_map(source_db, source_xml):
@@ -270,14 +349,14 @@ def convert_map(source_db, source_xml):
     cal_data = parse_orux_xml(source_xml)
 
     # Initialize the output MBTiles database
-    conn_mb = sqlite3.connect(output_file)
+    conn_mb = sqlite3.connect(output_file, timeout=15.0)
     cur_mb = conn_mb.cursor()
     cur_mb.execute("CREATE TABLE metadata (name text, value text);")
     cur_mb.execute("CREATE TABLE tiles (zoom_level integer, tile_column integer, tile_row integer, tile_data blob);")
 
     # Performance pragmas for massive bulk inserts
     cur_mb.execute("PRAGMA synchronous=OFF")
-    cur_mb.execute("PRAGMA journal_mode=MEMORY")
+    cur_mb.execute("PRAGMA journal_mode=WAL")
 
     pool = None
     if USE_MULTIPROCESSING:
@@ -347,10 +426,15 @@ def convert_map(source_db, source_xml):
             pool.close()
             pool.join()
 
+    cur_mb.execute("CREATE UNIQUE INDEX IF NOT EXISTS tile_index ON tiles (zoom_level, tile_column, tile_row);")
+
+    # Save original tiles before workers try to read them.
+    conn_mb.commit()
+
     # ---- Missing levels generation ----
     if GENERATE_MISSING_ZOOMS:
         print(f"\n   🔍 Launch missing levels generator...")
-        fill_missing_zooms(conn_mb)
+        fill_missing_zooms(conn_mb, output_file)
     # ------------------------------------------------------
 
     # Populate MBTiles required metadata
@@ -370,6 +454,7 @@ def convert_map(source_db, source_xml):
     cur_mb.execute("CREATE UNIQUE INDEX IF NOT EXISTS tile_index ON tiles (zoom_level, tile_column, tile_row);")
 
     conn_mb.commit()
+    cur_mb.execute("PRAGMA journal_mode=DELETE")
     conn_mb.close()
 
     map_elapsed = time.strftime("%H:%M:%S", time.gmtime(time.time() - map_start_time))
