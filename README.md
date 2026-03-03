@@ -16,6 +16,8 @@ This script solves this by **reading the Orux XML calibration file**. It calcula
 * **Pixel-Perfect Alignment:** Uses XML Top-Left (TL) anchor points to recalculate and snap tiles to the absolute Web Mercator grid.
 * **Smart Resizing:** Automatically detects 512x512px source tiles and slices them into standard 256x256px MBTiles.
 * **Multiprocessing Powered:** Utilizes 100% of your CPU cores to process thousands of tiles concurrently.
+* **Missing Zoom Interpolation:** Optionally generates intermediate zoom levels (e.g., creating Z13, Z14, Z15 if only Z12 and Z16 exist) using a high-quality Quadtree cascading downscale to prevent black screens in your GPS app. 
+* **Smart Metadata Generation:** Automatically calculates and injects standard MBTiles metadata (`minzoom`, `maxzoom`, `type: overlay`) so apps understand the map's boundaries instantly.
 * **Live Time Tracking:** Displays elapsed time for each map and the total batch job.
 * **Low RAM Footprint:** Instead of building a massive map in memory, it calculates overlaps mathematically and loads only the required source tiles per zoom level.
 
