@@ -263,6 +263,14 @@ def convert_map(source_db, source_xml):
     cur_mb.execute("INSERT INTO metadata VALUES ('format', 'jpg')")
     cur_mb.execute("INSERT INTO metadata VALUES ('type', 'overlay')")
     cur_mb.execute("INSERT INTO metadata VALUES ('version', '1.0')")
+
+    # Get zoom min and max levels from calibration data
+    zooms = list(cal_data.keys())
+    if zooms:
+        cur_mb.execute("INSERT INTO metadata VALUES ('minzoom', ?)", (str(min(zooms)),))
+        cur_mb.execute("INSERT INTO metadata VALUES ('maxzoom', ?)", (str(max(zooms)),))
+    # ----------------------------------
+
     cur_mb.execute("CREATE UNIQUE INDEX IF NOT EXISTS tile_index ON tiles (zoom_level, tile_column, tile_row);")
 
     conn_mb.commit()
