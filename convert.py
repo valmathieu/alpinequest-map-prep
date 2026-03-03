@@ -15,6 +15,8 @@ USE_MULTIPROCESSING = True
 # Define the root folder containing your region subfolders (e.g., "./cartes" or "C:/Maps")
 # "." means the current folder where the script is located.
 ROOT_FOLDER = "./France IGN 2019"
+# Set to True to generate missing intermediary zoom levels
+GENERATE_MISSING_ZOOMS = True
 # ---------------------
 
 # Remove limit on image size to prevent DecompressionBomb errors with large map tiles
@@ -157,6 +159,94 @@ def parse_orux_xml(xml_file):
     return cal_data
 
 
+def fill_missing_zooms(conn_mb):
+    """
+        Generates missing intermediate zoom levels using a cascading Quadtree downscale.
+
+        Scans the MBTiles database for gaps between the maximum and minimum available
+        zoom levels. For every missing level `z`, it fetches the four corresponding
+        "parent" tiles from `z+1`, stitches them onto a 512x512 canvas, and applies
+        a high-quality Lanczos resampling to downscale them into a standard 256x256
+        MBTile. This prevents "black screens" in navigation apps when zooming between
+        native map resolutions.
+
+        Args:
+            conn_mb (sqlite3.Connection): An active SQLite database connection to
+                the target .mbtiles file.
+
+        Returns:
+            None: The function modifies the database in-place by inserting new tiles
+            and commits the changes after completing each zoom level.
+        """
+    cur = conn_mb.cursor()
+    cur.execute("SELECT DISTINCT zoom_level FROM tiles ORDER BY zoom_level DESC")
+    existing_zooms = [row[0] for row in cur.fetchall()]
+
+    if not existing_zooms:
+        return
+
+    max_z = max(existing_zooms)
+    min_z = min(existing_zooms)
+
+    # Browse from max_z to min_z to fill gaps
+    for z in range(max_z - 1, min_z - 1, -1):
+        if z in existing_zooms:
+            print(f"      ⏩ Zoom {z} detected (original source kept).")
+            continue
+
+        print(f"      🔨 Crafting Zoom {z} (reduction from Zoom {z + 1})...")
+        # Find all necessary parent tiles to cover level z
+        cur.execute("SELECT DISTINCT tile_column / 2, tile_row / 2 FROM tiles WHERE zoom_level = ?", (z + 1,))
+        parents = cur.fetchall()
+
+        created = 0
+        total = len(parents)
+
+        for i, (px, py) in enumerate(parents):
+            # Create a 512x512 white canva to paste children tiles
+            canvas = Image.new('RGB', (512, 512), (255, 255, 255))
+            has_content = False
+
+            # TMS position (origin is bottom-left)
+            children = {
+                (2 * px, 2 * py + 1): (0, 0),  # Top-Left
+                (2 * px + 1, 2 * py + 1): (256, 0),  # Top-Right
+                (2 * px, 2 * py): (0, 256),  # Bottom-Left
+                (2 * px + 1, 2 * py): (256, 256)  # Bottom-Right
+            }
+
+            for (cx, cy), paste_pos in children.items():
+                cur.execute("SELECT tile_data FROM tiles WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?",
+                            (z + 1, cx, cy))
+                row = cur.fetchone()
+                if row:
+                    try:
+                        child_img = Image.open(io.BytesIO(row[0]))
+                        if child_img.mode != 'RGB':
+                            child_img = child_img.convert('RGB')
+                        canvas.paste(child_img, paste_pos)
+                        has_content = True
+                    except Exception:
+                        pass
+
+            if has_content:
+                # Resize high quality (downscale) to 256x256
+                # Use of Image.Resampling.LANCZOS to keep map sharpness
+                final_tile = canvas.resize((256, 256), getattr(Image, 'Resampling', Image).LANCZOS)
+                img_byte_arr = io.BytesIO()
+                final_tile.save(img_byte_arr, format='JPEG', quality=85)
+
+                cur.execute("INSERT INTO tiles VALUES (?, ?, ?, ?)", (z, px, py, img_byte_arr.getvalue()))
+                created += 1
+
+            if (i + 1) % 1000 == 0:
+                print(f"         ... Progression : {i + 1}/{total} generated tiles.")
+
+        print(f"      ✅ Zoom {z} done ({created} tiles generated).")
+        # Save after each generated zoom
+        conn_mb.commit()
+
+
 def convert_map(source_db, source_xml):
     """
     Orchestrates the conversion of a single OruxMaps map into an MBTiles file.
@@ -257,6 +347,12 @@ def convert_map(source_db, source_xml):
             pool.close()
             pool.join()
 
+    # ---- Missing levels generation ----
+    if GENERATE_MISSING_ZOOMS:
+        print(f"\n   🔍 Launch missing levels generator...")
+        fill_missing_zooms(conn_mb)
+    # ------------------------------------------------------
+
     # Populate MBTiles required metadata
     map_name = os.path.splitext(os.path.basename(source_db))[0]
     cur_mb.execute("INSERT INTO metadata VALUES ('name', ?)", (map_name,))
@@ -264,12 +360,12 @@ def convert_map(source_db, source_xml):
     cur_mb.execute("INSERT INTO metadata VALUES ('type', 'overlay')")
     cur_mb.execute("INSERT INTO metadata VALUES ('version', '1.0')")
 
-    # Get zoom min and max levels from calibration data
-    zooms = list(cal_data.keys())
-    if zooms:
-        cur_mb.execute("INSERT INTO metadata VALUES ('minzoom', ?)", (str(min(zooms)),))
-        cur_mb.execute("INSERT INTO metadata VALUES ('maxzoom', ?)", (str(max(zooms)),))
-    # ----------------------------------
+    # Computing and auto adding of minzoom and maxzoom based on real file content
+    cur_mb.execute("SELECT MIN(zoom_level), MAX(zoom_level) FROM tiles")
+    min_z, max_z = cur_mb.fetchone()
+    if min_z is not None and max_z is not None:
+        cur_mb.execute("INSERT INTO metadata VALUES ('minzoom', ?)", (str(min_z),))
+        cur_mb.execute("INSERT INTO metadata VALUES ('maxzoom', ?)", (str(max_z),))
 
     cur_mb.execute("CREATE UNIQUE INDEX IF NOT EXISTS tile_index ON tiles (zoom_level, tile_column, tile_row);")
 
