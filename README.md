@@ -21,7 +21,7 @@ This script solves this by **reading the Orux XML calibration file**. It calcula
 * **Multiprocessing Powered:** Utilizes 100% of your CPU cores to process thousands of tiles concurrently.
 * **Low RAM Footprint:** Instead of building a massive map in memory, it calculates overlaps mathematically and loads only the required source tiles per zoom level.
 
-## Installation
+## Installation & Launch
 
 1. Clone or download this repository.
 2. Open your terminal (e.g., PowerShell) in the project folder.
@@ -29,4 +29,10 @@ This script solves this by **reading the Orux XML calibration file**. It calcula
 
 ```powershell
 uv sync
+```
+
+4. Run conversion script:
+
+```powershell
+uv run convert.py
 ```
